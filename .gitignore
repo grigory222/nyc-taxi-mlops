@@ -1,0 +1,22 @@
+# Airflow
+airflow/airflow.db
+airflow/logs/
+airflow/simple_auth_manager_passwords.json.generated
+airflow/standalone_admin_password.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pkl
+.ipynb_checkpoints/
+
+# Env
+.env
+*.env
+
+# Docker
+postgres_data/
+
+# IDE
+.idea/
+.vscode/
