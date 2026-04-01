@@ -20,3 +20,4 @@ postgres_data/
 # IDE
 .idea/
 .vscode/
+.env
