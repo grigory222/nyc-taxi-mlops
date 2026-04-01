@@ -68,25 +68,6 @@ def nyc_taxi_train():
         )
         _LOG.info(f"Loaded {len(data)} rows from PostgreSQL.")
 
-        s3_hook = S3Hook("s3_connection")
-        session = s3_hook.get_session("ru-central1")
-        resource = session.resource("s3", endpoint_url=S3_ENDPOINT)
-        resource.Object(BUCKET, "datasets/taxi_trips.pkl").put(
-            Body=pickle.dumps(data)
-        )
-        _LOG.info("Data uploaded to S3.")
-
-    @task
-    def prepare_data() -> None:
-        s3_hook = S3Hook("s3_connection")
-        session = s3_hook.get_session("ru-central1")
-        resource = session.resource("s3", endpoint_url=S3_ENDPOINT)
-
-        file = s3_hook.download_file(
-            key="datasets/taxi_trips.pkl", bucket_name=BUCKET
-        )
-        data = pd.read_pickle(file)
-
         X = data[FEATURES]
         y = data[TARGET]
 
@@ -98,7 +79,10 @@ def nyc_taxi_train():
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
 
-        # Сохраняем скейлер — нужен для инференса в FastAPI
+        s3_hook = S3Hook("s3_connection")
+        session = s3_hook.get_session("ru-central1")
+        resource = session.resource("s3", endpoint_url=S3_ENDPOINT)
+
         resource.Object(BUCKET, "models/scaler.pkl").put(
             Body=pickle.dumps(scaler)
         )
@@ -111,8 +95,9 @@ def nyc_taxi_train():
                 Body=pickle.dumps(array)
             )
 
-        _LOG.info("Data preparation finished.")
-
+        _LOG.info("Data prepared and uploaded to S3.")
+    
+    
     @task
     def train_model(model_name: str) -> dict:
         s3_hook = S3Hook("s3_connection")
@@ -173,17 +158,12 @@ def nyc_taxi_train():
 
         _LOG.info("Results saved.")
 
-    # Цепочка
     init_task = init()
     get_data_task = get_data_from_postgres()
-    prepare_task = prepare_data()
-
-    # Параллельное обучение
     metrics = [train_model(model_name) for model_name in MODELS.keys()]
-
     save_task = save_results(metrics)
 
-    init_task >> get_data_task >> prepare_task >> metrics >> save_task
+    init_task >> get_data_task >> metrics >> save_task
 
 
 nyc_taxi_train()

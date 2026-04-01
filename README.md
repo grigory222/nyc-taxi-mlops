@@ -4,9 +4,11 @@ MLOps пет-проект: автоматизированный пайплайн
 
 ## Что делает проект
 
-Проект предсказывает **длительность поездки на такси в Нью-Йорке** в минутах на основе параметров поездки: откуда, куда, время суток, расстояние, стоимость.
+Проект предсказывает **длительность поездки на такси в Нью-Йорке** в минутах на основе параметров поездки: район отправления и прибытия, дистанция, тариф, время суток и день недели.
 
-### Как идут данные
+Данные — реальные записи о поездках жёлтого такси Нью-Йорка (NYC TLC Yellow Taxi), ~3 млн строк.
+
+## Как идут данные
 ```
 NYC TLC сайт (parquet файлы)
         ↓
@@ -17,12 +19,21 @@ PostgreSQL — хранение всех поездок
 nyc_taxi_ingest DAG — ежемесячно проверяет новые данные,
                       заливает в PostgreSQL, триггерит обучение
         ↓
-nyc_taxi_train DAG — обучает 3 модели параллельно,
-                     выбирает лучшую, сохраняет в S3
+nyc_taxi_train DAG:
+  get_data_from_postgres — читает из PostgreSQL, нормализует,
+                           сохраняет prepared данные и scaler в S3
         ↓
-Yandex Cloud S3 — хранит модели (.pkl) и метрики (.json)
+  train_model x3 — параллельно обучают три модели
         ↓
-FastAPI — загружает модель из S3, отдаёт предсказания
+  save_results — выбирает лучшую по R², сохраняет в S3
+        ↓
+Yandex Cloud S3:
+  models/best_model.pkl   — лучшая модель
+  models/scaler.pkl       — нормализатор для инференса
+  models/*.pkl            — все три модели
+  results/{дата}.json     — метрики каждого обучения
+        ↓
+FastAPI — загружает модель и scaler из S3, отдаёт предсказания
 ```
 
 ## Стек
@@ -38,39 +49,35 @@ FastAPI — загружает модель из S3, отдаёт предска
 
 ![nyc_taxi_train DAG](docs/train_dag.png)
 
-Запускается вручную или по триггеру от `nyc_taxi_ingest`. Обучает три модели параллельно и сохраняет лучшую.
+Запускается вручную или по триггеру от `nyc_taxi_ingest`.
+```
+init → get_data_from_postgres → [train_model x3] → save_results
+```
 
-**Таски:**
+**`init`** — логирует старт пайплайна.
 
-`init` — логирует старт пайплайна.
+**`get_data_from_postgres`** — читает 100к случайных строк из PostgreSQL, делает train/test split (80/20), нормализует через StandardScaler. Сохраняет в S3 четыре массива (`X_train`, `X_test`, `y_train`, `y_test`) и `scaler.pkl`.
 
-`get_data_from_postgres` — подключается к PostgreSQL через `pg_connection`, делает выборку 100 000 случайных строк из таблицы `taxi_trips`, сериализует в pickle и загружает в S3 по пути `datasets/taxi_trips.pkl`.
+**`train_model` x3** — три таска запускаются параллельно, каждый обучает свою модель: RandomForest, GradientBoosting, LinearRegression. Скачивают данные из S3, обучают модель, считают R²/RMSE/MAE, сохраняют модель в S3, возвращают метрики через XCom.
 
-`prepare_data` — скачивает датасет из S3, разделяет на train/test (80/20), нормализует фичи через `StandardScaler`. Сохраняет в S3 четыре файла: `X_train.pkl`, `X_test.pkl`, `y_train.pkl`, `y_test.pkl`. Скейлер сохраняется отдельно как `models/scaler.pkl` — он нужен FastAPI для нормализации входных данных при инференсе.
-
-`train_model`, `train_model__1`, `train_model__2` — три таска запускаются **параллельно**, каждый обучает свою модель: `RandomForestRegressor`, `GradientBoostingRegressor`, `LinearRegression`. Каждый таск скачивает подготовленные данные из S3, обучает модель, считает метрики (R², RMSE, MAE), сохраняет модель в S3 и возвращает метрики через **XCom**.
-
-`save_results` — получает метрики всех трёх моделей из XCom, выбирает лучшую по R², копирует её в S3 как `models/best_model.pkl`. Сохраняет все метрики в `results/{дата}.json`.
+**`save_results`** — получает метрики всех моделей из XCom, выбирает лучшую по R², копирует её в `models/best_model.pkl`, сохраняет все метрики в `results/{дата}.json`.
 
 ## DAG: nyc_taxi_ingest
 
 ![nyc_taxi_ingest DAG](docs/ingest_dag.png)
 
-Запускается автоматически 1-го числа каждого месяца. Проверяет появились ли новые данные на сайте NYC TLC и при необходимости запускает переобучение.
+Запускается автоматически 1-го числа каждого месяца.
+```
+check_new_data → check_already_loaded → download_and_load → should_retrain → [trigger_training | skip]
+```
 
-**Таски:**
+**`check_new_data`** — делает HEAD запрос к NYC TLC, ищет последний доступный месяц. Возвращает `{"year": ..., "month": ...}` или `None`.
 
-`check_new_data` — делает HEAD запрос к сайту NYC TLC, ищет последний доступный месяц (перебирает от текущего назад). Если файл доступен — возвращает `{"year": ..., "month": ...}`, иначе `None`.
+**`check_already_loaded`** — проверяет в PostgreSQL не загружены ли уже данные за этот период. Защита от дублирования.
 
-`check_already_loaded` — проверяет в PostgreSQL есть ли уже строки с этим `year` и `month`. Если данные уже загружены — возвращает `None` чтобы не дублировать. Это защита от повторного запуска.
+**`download_and_load`** — скачивает parquet, делает feature engineering, фильтрует выбросы, заливает в PostgreSQL.
 
-`download_and_load` — если период не `None` — скачивает parquet файл с NYC TLC, делает feature engineering (длительность поездки, час, день недели, признак выходного), фильтрует выбросы, заливает в PostgreSQL. Возвращает `True` если данные залиты.
-
-`should_retrain` — ветвление (`@task.branch`): если данные залиты (`True`) — направляет в `trigger_training`, иначе в `skip`.
-
-`trigger_training` — триггерит DAG `nyc_taxi_train` через `TriggerDagRunOperator`. Переобучение запускается автоматически на свежих данных.
-
-`skip` — логирует что новых данных нет, ничего не делает.
+**`should_retrain`** — ветвление: если данные залиты — триггерит `nyc_taxi_train`, иначе — `skip`.
 
 ## Быстрый старт
 
@@ -151,7 +158,7 @@ curl -X POST http://localhost:8000/predict \
 
 Ответ:
 ```json
-{"duration_min": 12.87, "model": "random_forest"}
+{"duration_min":12.24,"model":"random_forest"}
 ```
 
 ### Эндпоинты
