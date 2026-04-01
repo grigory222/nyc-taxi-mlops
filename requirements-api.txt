@@ -1,0 +1,7 @@
+fastapi==0.117.1
+uvicorn==0.42.0
+boto3==1.42.80
+scikit-learn==1.8.0
+numpy==2.4.4
+pydantic==2.12.5
+pydantic-settings==2.9.1
